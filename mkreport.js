@@ -42,6 +42,10 @@ const xmlEscape = (s) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
+// Report convention: full-width Japanese commas/periods must be ASCII.
+const normalizePunctuation = (s) =>
+  String(s ?? "").replace(/、/g, ",").replace(/。/g, ".");
+
 // Look up an input file. PROJECT_ROOT is the user's project folder; the bundled
 // templates/ directory is the fallback when the project is missing a file.
 function findInputFile(name) {
@@ -191,7 +195,7 @@ function substitutePlaceholders(xml, map) {
   // Use a single regex with callback, matching #T<digits> or #<digits> NOT followed by another digit.
   return xml.replace(/#(T\d+|\d+)(?!\d)/g, (full, key) => {
     const k = "#" + key;
-    if (k in map) return xmlEscape(map[k]);
+    if (k in map) return xmlEscape(normalizePunctuation(map[k]));
     return full; // unknown placeholder: leave as-is
   });
 }
@@ -209,7 +213,7 @@ function pPlain(text, align = "left") {
   const runs = String(text)
     .split(/\n/)
     .map((line, idx, arr) => {
-      const t = `<w:r><w:t xml:space="preserve">${xmlEscape(line)}</w:t></w:r>`;
+      const t = `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(line))}</w:t></w:r>`;
       return idx < arr.length - 1 ? `${t}<w:r><w:br/></w:r>` : t;
     })
     .join("");
@@ -217,7 +221,7 @@ function pPlain(text, align = "left") {
 }
 
 function pCenter(text) {
-  return `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>`;
+  return `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(text))}</w:t></w:r></w:p>`;
 }
 
 function tableXml(rows) {
