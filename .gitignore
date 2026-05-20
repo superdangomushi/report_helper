@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# secrets / local config
+.env
+.env.local
+
+# generated reports — only at the repo root, leave templates/seed.docx etc. tracked
+/*.docx
+/test_*.docx
+
+# build / temp
+*.log
+.cache/

@@ -1,0 +1,13 @@
+{
+  "name": "report-helper",
+  "version": "0.1.0",
+  "description": "Build a Word report from seed.docx + section .md / .env files",
+  "bin": {
+    "mkreport": "./mkreport.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "image-size": "^2.0.2",
+    "jszip": "^3.10.1"
+  }
+}
