@@ -204,24 +204,75 @@ function substitutePlaceholders(xml, map) {
 const W_NS = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
 const M_NS = "xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"";
 
-function pPlain(text, align = "left") {
-  // paragraph with simple text; preserve leading/trailing spaces
-  if (text === "") return `<w:p/>`;
-  const pPr =
-    align === "center" ? `<w:pPr><w:jc w:val="center"/></w:pPr>` :
-    align === "right"  ? `<w:pPr><w:jc w:val="right"/></w:pPr>`  : "";
-  const runs = String(text)
-    .split(/\n/)
-    .map((line, idx, arr) => {
-      const t = `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(line))}</w:t></w:r>`;
-      return idx < arr.length - 1 ? `${t}<w:r><w:br/></w:r>` : t;
-    })
-    .join("");
-  return `<w:p>${pPr}${runs}</w:p>`;
+// Leading tabs become a nesting level. A literal tab character only indents the
+// first visual line, so wrapped lines fall back to the margin; converting tabs to
+// a paragraph-level left indent keeps every wrapped line aligned.
+const INDENT_PER_LEVEL = 840; // twips, matches the document's default tab stop
+const BULLET_HANGING = 420;   // hang width so wrapped bullet lines align under the text
+function stripLeadingTabs(line) {
+  let level = 0, i = 0;
+  while (i < line.length && line[i] === "\t") { level++; i++; }
+  return { level, rest: line.slice(i) };
 }
 
-function pCenter(text) {
-  return `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(text))}</w:t></w:r></w:p>`;
+// Classify a source line: a leading "- " / "* " (after any tabs) marks a bullet.
+function classifyLine(line) {
+  const { level, rest } = stripLeadingTabs(line);
+  const m = rest.match(/^[-*]\s+(.*)$/);
+  if (m) return { level, kind: "bullet", content: m[1] };
+  return { level, kind: "text", content: rest };
+}
+
+function pPlain(text, align = "left", opts = {}) {
+  // paragraph with simple text; preserve leading/trailing spaces
+  if (text === "") return `<w:p/>`;
+  const keep = (opts.keepNext ? `<w:keepNext/>` : "") + (opts.keepLines ? `<w:keepLines/>` : "");
+  const jc =
+    align === "center" ? `<w:jc w:val="center"/>` :
+    align === "right"  ? `<w:jc w:val="right"/>`  : "";
+
+  const lines = String(text).split(/\n/).map(classifyLine);
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const cur = lines[i];
+    if (cur.kind === "bullet") {
+      // Hanging indent: bullet glyph at level*840, text (and wrapped lines) at +420.
+      const left = cur.level * INDENT_PER_LEVEL + BULLET_HANGING;
+      const ind = `<w:ind w:left="${left}" w:hanging="${BULLET_HANGING}"/>`;
+      out.push(
+        `<w:p><w:pPr>${keep}${ind}${jc}</w:pPr>` +
+          `<w:r><w:t>・</w:t></w:r><w:r><w:tab/></w:r>` +
+          `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(cur.content))}</w:t></w:r>` +
+          `</w:p>`
+      );
+      i++;
+      continue;
+    }
+    // Group consecutive plain-text lines at the same indent level into one
+    // paragraph (joined by soft breaks) so wrapped lines keep the indent.
+    const level = cur.level;
+    const items = [];
+    while (i < lines.length && lines[i].kind === "text" && lines[i].level === level) {
+      items.push(lines[i].content);
+      i++;
+    }
+    const ind = level > 0 ? `<w:ind w:left="${level * INDENT_PER_LEVEL}"/>` : "";
+    const pPr = (keep || ind || jc) ? `<w:pPr>${keep}${ind}${jc}</w:pPr>` : "";
+    const runs = items
+      .map((line, idx, arr) => {
+        const t = `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(line))}</w:t></w:r>`;
+        return idx < arr.length - 1 ? `${t}<w:r><w:br/></w:r>` : t;
+      })
+      .join("");
+    out.push(`<w:p>${pPr}${runs}</w:p>`);
+  }
+  return out.join("");
+}
+
+function pCenter(text, opts = {}) {
+  const keep = (opts.keepNext ? `<w:keepNext/>` : "") + (opts.keepLines ? `<w:keepLines/>` : "");
+  return `<w:p><w:pPr>${keep}<w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(text))}</w:t></w:r></w:p>`;
 }
 
 function tableXml(rows) {
@@ -232,17 +283,21 @@ function tableXml(rows) {
   const gridCols = Array.from({ length: colCount }, () => `<w:gridCol w:w="${colWidth}"/>`).join("");
 
   const trXml = rows
-    .map((row) => {
+    .map((row, rIdx) => {
+      // keepNext on every row but the last glues the rows together, so a table
+      // that fits on one page jumps to the next page intact rather than splitting.
+      const keepNext = rIdx < rows.length - 1;
       const tcs = [];
       for (let c = 0; c < colCount; c++) {
         const cell = row[c] ?? "";
         tcs.push(
           `<w:tc><w:tcPr><w:tcW w:w="${colWidth}" w:type="dxa"/></w:tcPr>` +
-            pPlain(cell) +
+            pPlain(cell, "left", { keepNext }) +
             `</w:tc>`
         );
       }
-      return `<w:tr>${tcs.join("")}</w:tr>`;
+      // cantSplit stops a single row from straddling a page boundary.
+      return `<w:tr><w:trPr><w:cantSplit/></w:trPr>${tcs.join("")}</w:tr>`;
     })
     .join("");
 
@@ -591,8 +646,10 @@ function parseFigureFilename(filename) {
 
 function figureXml(rId, cx, cy, captionText) {
   // cx/cy in EMU. drawing inline.
+  // keepNext keeps the figure glued to its caption; keepLines stops the figure
+  // from straddling a page boundary, so an oversized figure starts on a fresh page.
   const drawing =
-    `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>` +
+    `<w:p><w:pPr><w:keepNext/><w:keepLines/><w:jc w:val="center"/></w:pPr><w:r><w:drawing>` +
     `<wp:inline distT="0" distB="0" distL="0" distR="0" ` +
     `xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ` +
     `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ` +
@@ -611,7 +668,7 @@ function figureXml(rId, cx, cy, captionText) {
     `</pic:pic>` +
     `</a:graphicData></a:graphic>` +
     `</wp:inline></w:drawing></w:r></w:p>`;
-  const caption = pCenter(captionText);
+  const caption = pCenter(captionText, { keepLines: true });
   return drawing + caption;
 }
 
@@ -680,6 +737,21 @@ async function buildReport(projectArg, outputArg) {
 
   let docXml = await zip.file("word/document.xml").async("string");
 
+  // Body text width in EMU = (page width - left - right margin) twips * 635.
+  // Used by the `<->` figure marker to stretch an image to the full text column.
+  let bodyWidthEmu = 5400040; // fallback: A4 with 30mm margins
+  {
+    const szM = docXml.match(/<w:pgSz\b[^>]*w:w="(\d+)"/);
+    const marM = docXml.match(/<w:pgMar\b[^>]*?w:right="(\d+)"[^>]*?w:left="(\d+)"/) ||
+                 docXml.match(/<w:pgMar\b[^>]*?w:left="(\d+)"[^>]*?w:right="(\d+)"/);
+    if (szM && marM) {
+      const pageW = Number(szM[1]);
+      const a = Number(marM[1]), b = Number(marM[2]);
+      const textW = pageW - a - b;
+      if (textW > 0) bodyWidthEmu = textW * 635;
+    }
+  }
+
   // 1) substitute title placeholders
   docXml = substitutePlaceholders(docXml, titleMap);
 
@@ -711,13 +783,15 @@ async function buildReport(projectArg, outputArg) {
       } else if (b.type === "table") {
         out.push(tableXml(b.rows));
       } else if (b.type === "fence") {
-        const content = b.content;
+        // `<->` anywhere in the fence stretches a figure to the full text width.
+        const fullWidth = b.content.includes("<->");
+        const content = b.content.replace(/<->/g, "").trim();
 
         // 1) OCR table: file in ocr_hyo/
         const ocrPath = findAssetFile(content, "ocr_hyo");
         if (ocrPath && /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(content)) {
           const info = parseTableFilename(content);
-          if (info) out.push(pCenter(`表${info.number} ${info.name}`));
+          if (info) out.push(pCenter(`表${info.number} ${info.name}`, { keepNext: true }));
           const rows = await geminiOcrTable(ocrPath);
           if (rows && rows.length > 0) {
             out.push(tableXml(rows));
@@ -736,11 +810,16 @@ async function buildReport(projectArg, outputArg) {
           try {
             const dim = imageSize(buf);
             if (dim?.width && dim?.height) {
-              const maxCx = 5029200;
               const pxToEmu = 9525;
               let w = dim.width * pxToEmu;
               let h = dim.height * pxToEmu;
-              if (w > maxCx) { h = h * (maxCx / w); w = maxCx; }
+              if (fullWidth) {
+                // Scale to exactly the text-column width, keeping aspect ratio.
+                h = h * (bodyWidthEmu / w); w = bodyWidthEmu;
+              } else {
+                const maxCx = 5029200;
+                if (w > maxCx) { h = h * (maxCx / w); w = maxCx; }
+              }
               cx = Math.round(w); cy = Math.round(h);
             }
           } catch {}
