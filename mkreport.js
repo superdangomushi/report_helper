@@ -204,20 +204,28 @@ function substitutePlaceholders(xml, map) {
 const W_NS = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
 const M_NS = "xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"";
 
-// Leading tabs become a nesting level. A literal tab character only indents the
-// first visual line, so wrapped lines fall back to the margin; converting tabs to
-// a paragraph-level left indent keeps every wrapped line aligned.
+// Leading whitespace becomes a nesting level: one tab, or SPACES_PER_LEVEL
+// half-width spaces, per level. A literal tab/space only indents the first
+// visual line, so wrapped lines fall back to the margin; converting the indent
+// to a paragraph-level left indent keeps every wrapped line aligned.
 const INDENT_PER_LEVEL = 840; // twips, matches the document's default tab stop
+const SPACES_PER_LEVEL = 4;   // four leading half-width spaces == one nesting level
 const BULLET_HANGING = 420;   // hang width so wrapped bullet lines align under the text
-function stripLeadingTabs(line) {
-  let level = 0, i = 0;
-  while (i < line.length && line[i] === "\t") { level++; i++; }
+function stripLeadingIndent(line) {
+  let i = 0, tabs = 0, spaces = 0;
+  while (i < line.length && (line[i] === "\t" || line[i] === " ")) {
+    if (line[i] === "\t") tabs++; else spaces++;
+    i++;
+  }
+  // Full-width spaces (　, used for Japanese first-line indent) are intentionally
+  // left in `rest`; only tabs and half-width spaces count toward nesting.
+  const level = tabs + Math.floor(spaces / SPACES_PER_LEVEL);
   return { level, rest: line.slice(i) };
 }
 
-// Classify a source line: a leading "- " / "* " (after any tabs) marks a bullet.
+// Classify a source line: a leading "- " / "* " (after any indent) marks a bullet.
 function classifyLine(line) {
-  const { level, rest } = stripLeadingTabs(line);
+  const { level, rest } = stripLeadingIndent(line);
   const m = rest.match(/^[-*]\s+(.*)$/);
   if (m) return { level, kind: "bullet", content: m[1] };
   return { level, kind: "text", content: rest };
