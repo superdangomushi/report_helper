@@ -19,22 +19,38 @@ function printUsageAndExit(code = 1) {
   console.error(
     [
       "Usage:",
-      "  mkreport setup                    Open a GUI to set the Gemini API key (saved per-user)",
-      "  mkreport start <project-name>     Scaffold a new project from templates/",
-      "  mkreport <project-path>           Build report from a project folder",
-      "  mkreport <project-path> <output>  Build to a specific output path",
+      "  mkreport setup                          Open a GUI to set the Gemini API key (saved per-user)",
+      "  mkreport start <project-name>           Scaffold a new project from templates/",
+      "  mkreport [--ocr] <project-path>         Build report from a project folder",
+      "  mkreport [--ocr] <project-path> <out>   Build to a specific output path",
+      "",
+      "Flags:",
+      "  --ocr   Run Gemini OCR on ocr_hyo/ images. Refreshes any existing",
+      "          <OCR-...>…</OCR-...> blocks too. Without this flag, OCR fences",
+      "          render as a placeholder caption and cached OCR blocks render as-is.",
       "",
       "Examples:",
       "  mkreport setup",
       "  mkreport start my_first_report",
       "  mkreport ./my_first_report",
-      "  mkreport ./my_first_report report.docx",
+      "  mkreport --ocr ./my_first_report report.docx",
     ].join("\n")
   );
   process.exit(code);
 }
 
-const args = process.argv.slice(2);
+const FLAGS = { ocr: false };
+const args = [];
+for (const a of process.argv.slice(2)) {
+  if (a === "--ocr") FLAGS.ocr = true;
+  else if (a === "--help" || a === "-h") args.push(a);
+  else if (a.startsWith("--")) {
+    console.error(`error: unknown flag ${a}`);
+    printUsageAndExit();
+  } else {
+    args.push(a);
+  }
+}
 if (args.length < 1) printUsageAndExit();
 
 // PROJECT_ROOT is set by buildReport(); helper functions use it.
@@ -685,6 +701,91 @@ async function geminiOcrTable(imagePath) {
   }
 }
 
+// ---------- OCR block markers (<OCR-filename>…</OCR-filename>) ----------
+// These wrap an OCR'd caption + Markdown table inside source .md files so the
+// user can spot what came from OCR and re-OCR easily. They're parser-invisible
+// in normal builds (just stripped) and act as re-OCR sentinels under --ocr.
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function preprocessOcrMarkers(text, ocrEnabled) {
+  if (ocrEnabled) {
+    // Convert existing OCR blocks back to a bare fence so the OCR pipeline
+    // refreshes them on this run.
+    return text.replace(
+      /<OCR-([^>\n]+)>[\s\S]*?<\/OCR-\1>/g,
+      (_, filename) => "```" + filename + "```"
+    );
+  }
+  // OCR disabled: drop marker lines, keep the cached caption + table visible.
+  return text.replace(/^[ \t]*<\/?OCR-[^>\n]+>[ \t]*\r?\n?/gm, "");
+}
+
+function rowsToMarkdown(rows) {
+  if (!rows || !rows.length) return "";
+  const escape = (c) => String(c ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  const colCount = Math.max(...rows.map((r) => r.length));
+  const pad = (r) => Array.from({ length: colCount }, (_, i) => escape(r[i] ?? ""));
+  const header = `| ${pad(rows[0]).join(" | ")} |`;
+  const sep = `| ${Array.from({ length: colCount }, () => "---").join(" | ")} |`;
+  const body = rows.slice(1).map((r) => `| ${pad(r).join(" | ")} |`).join("\n");
+  return [header, sep, body].filter(Boolean).join("\n");
+}
+
+// Replace either an existing <OCR-filename>…</OCR-filename> block or a bare
+// ```filename``` fence with `replacement`. Used to write OCR results back into
+// the source .md so the table becomes editable and re-OCR'able.
+function replaceOcrSourceInMd(text, filename, replacement) {
+  const blockRe = new RegExp(
+    `<OCR-${escapeRegex(filename)}>[\\s\\S]*?</OCR-${escapeRegex(filename)}>`
+  );
+  if (blockRe.test(text)) {
+    return { text: text.replace(blockRe, replacement), replaced: true };
+  }
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(eol);
+  const out = [];
+  let i = 0;
+  let replaced = false;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!replaced) {
+      const inline = line.match(/^\s*```(.*?)```\s*$/);
+      if (inline && inline[1].trim() === filename) {
+        out.push(replacement);
+        replaced = true;
+        i++;
+        continue;
+      }
+      if (/^\s*```/.test(line) && !inline) {
+        const startIdx = i;
+        const firstLineContent = line.replace(/^\s*```\S*\s*/, "");
+        const buf = [];
+        if (firstLineContent) buf.push(firstLineContent);
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) {
+          buf.push(lines[i]);
+          i++;
+        }
+        const endIdx = i;
+        i++; // consume closing fence
+        const content = buf.join("\n").trim();
+        if (content === filename) {
+          out.push(replacement);
+          replaced = true;
+          continue;
+        }
+        for (let j = startIdx; j <= endIdx; j++) out.push(lines[j]);
+        continue;
+      }
+    }
+    out.push(line);
+    i++;
+  }
+  return { text: out.join(eol), replaced };
+}
+
 function parseTableFilename(filename) {
   // "1-1-1売上表.png" -> {number:"1.1.1", name:"売上表"}
   const m = filename.match(/^(\d+(?:-\d+)*)(.+?)\.(jpg|jpeg|png|gif|bmp|webp)$/i);
@@ -924,7 +1025,9 @@ async function buildReport(projectArg, outputArg) {
     return id;
   }
 
-  async function renderBlocks(blocks) {
+  const mdRewrites = []; // {fileName, fenceContent, replacement}
+
+  async function renderBlocks(blocks, fileName) {
     const out = [];
     for (const b of blocks) {
       if (b.type === "p") {
@@ -940,10 +1043,22 @@ async function buildReport(projectArg, outputArg) {
         const ocrPath = findAssetFile(content, "ocr_hyo");
         if (ocrPath && /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(content)) {
           const info = parseTableFilename(content);
-          if (info) out.push(pCenter(`表${info.number} ${info.name}`, { keepNext: true }));
+          const captionText = info ? `表${info.number} ${info.name}` : content;
+          if (!FLAGS.ocr) {
+            // Without --ocr we don't call the API. Drop a centered placeholder so
+            // the doc still shows where the table belongs.
+            out.push(pCenter(`${captionText} (OCR未実行 — --ocr を付けて再実行してください)`));
+            continue;
+          }
+          out.push(pCenter(captionText, { keepNext: true }));
           const result = await geminiOcrTable(ocrPath);
           if (result.rows && result.rows.length > 0) {
             out.push(tableXml(result.rows));
+            // Queue source .md rewrite: replace fence (or stale OCR block) with
+            // a fresh <OCR-…>…</OCR-…> block so the user can edit / re-OCR later.
+            const replacement =
+              `<OCR-${content}>\n/c ${captionText} c/\n\n${rowsToMarkdown(result.rows)}\n</OCR-${content}>`;
+            mdRewrites.push({ fileName, fenceContent: content, replacement });
           } else {
             const reason = result.error || "不明なエラー";
             console.warn(`[OCR 失敗] ${content}: ${reason}`);
@@ -1001,7 +1116,8 @@ async function buildReport(projectArg, outputArg) {
   // Build per-section XML
   const sectionXmls = {};
   for (const s of sections) {
-    const mdText = readTextIfExists(findInputFile(s.file));
+    const rawText = readTextIfExists(findInputFile(s.file));
+    const mdText = preprocessOcrMarkers(rawText, FLAGS.ocr);
     const chunks = splitByAlignment(mdText);
     const blocks = [];
     for (const c of chunks) {
@@ -1011,7 +1127,31 @@ async function buildReport(projectArg, outputArg) {
         blocks.push(b);
       }
     }
-    sectionXmls[s.num] = await renderBlocks(blocks);
+    sectionXmls[s.num] = await renderBlocks(blocks, s.file);
+  }
+
+  // Apply queued OCR rewrites back to the source .md files. Always writes to
+  // PROJECT_ROOT so we never modify bundled templates in place.
+  if (mdRewrites.length) {
+    const byFile = {};
+    for (const r of mdRewrites) {
+      (byFile[r.fileName] = byFile[r.fileName] || []).push(r);
+    }
+    for (const [fileName, rewrites] of Object.entries(byFile)) {
+      const dst = path.join(PROJECT_ROOT, fileName);
+      const srcPath = fs.existsSync(dst) ? dst : findInputFile(fileName);
+      if (!srcPath) continue;
+      let text = fs.readFileSync(srcPath, "utf8").replace(/^﻿/, "");
+      let any = false;
+      for (const r of rewrites) {
+        const res = replaceOcrSourceInMd(text, r.fenceContent, r.replacement);
+        if (res.replaced) { text = res.text; any = true; }
+      }
+      if (any) {
+        fs.writeFileSync(dst, text);
+        console.log(`updated ${dst}: OCR結果を <OCR-…> ブロックに反映しました`);
+      }
+    }
   }
 
   // Build citation XML (6, 引用)
