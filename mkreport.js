@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import JSZip from "jszip";
 import { imageSize } from "image-size";
 
@@ -9,17 +11,21 @@ const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
 const CWD = process.cwd();
 const TEMPLATES_DIR = path.join(SCRIPT_DIR, "templates");
+const USER_CONFIG_DIR = path.join(os.homedir(), ".mkreport");
+const USER_CONFIG_FILE = path.join(USER_CONFIG_DIR, "config.env");
 
 // ---------- CLI ----------
 function printUsageAndExit(code = 1) {
   console.error(
     [
       "Usage:",
+      "  mkreport setup                    Open a GUI to set the Gemini API key (saved per-user)",
       "  mkreport start <project-name>     Scaffold a new project from templates/",
       "  mkreport <project-path>           Build report from a project folder",
       "  mkreport <project-path> <output>  Build to a specific output path",
       "",
       "Examples:",
+      "  mkreport setup",
       "  mkreport start my_first_report",
       "  mkreport ./my_first_report",
       "  mkreport ./my_first_report report.docx",
@@ -46,11 +52,16 @@ const xmlEscape = (s) =>
 const normalizePunctuation = (s) =>
   String(s ?? "").replace(/、/g, ",").replace(/。/g, ".");
 
-// Look up an input file. PROJECT_ROOT is the user's project folder; the bundled
-// templates/ directory is the fallback when the project is missing a file.
+// Look up an input file. Lookup order:
+//   1. PROJECT_ROOT       — project-specific override (highest priority)
+//   2. USER_CONFIG_DIR    — per-user shared (~/.mkreport/, populated by `mkreport setup`)
+//   3. TEMPLATES_DIR      — bundled defaults
+// This lets users keep one customized seed.docx / hyo1.docx in ~/.mkreport/
+// and have it picked up by every project automatically.
 function findInputFile(name) {
   const candidates = [
     path.join(PROJECT_ROOT, name),
+    path.join(USER_CONFIG_DIR, name),
     path.join(TEMPLATES_DIR, name),
   ];
   for (const p of candidates) if (fs.existsSync(p)) return p;
@@ -73,10 +84,13 @@ function readTextIfExists(p) {
 }
 
 // Minimal .env reader (KEY=VALUE per line). Strips surrounding quotes.
+// Lookup order: process env → project .env → per-user config (mkreport setup)
+// → bundled templates/.env → script dir .env.
 function readEnvVar(key) {
   if (process.env[key]) return process.env[key];
   const candidates = [
     path.join(PROJECT_ROOT, ".env"),
+    USER_CONFIG_FILE,
     path.join(TEMPLATES_DIR, ".env"),
     path.join(SCRIPT_DIR, ".env"),
   ];
@@ -190,13 +204,36 @@ function parseMarkdown(text) {
 }
 
 // ---------- placeholder substitution in document.xml ----------
+// Keys that appear multiple times in the seed (e.g. #4 = 氏名 + 班番号) can be
+// filled from one CSV value: occurrence N gets CSV part N (clamped to the last).
+// Single-occurrence keys keep their value verbatim so commas inside e.g. #T1 stay intact.
 function substitutePlaceholders(xml, map) {
-  // Replace longer keys first (#T1, #19..#10, #9..#1)
-  // Use a single regex with callback, matching #T<digits> or #<digits> NOT followed by another digit.
-  return xml.replace(/#(T\d+|\d+)(?!\d)/g, (full, key) => {
+  const re = /#(T\d+|\d+)(?!\d)/g;
+  const counts = {};
+  for (const m of xml.matchAll(re)) {
+    const k = "#" + m[1];
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const parts = {};
+  const cursor = {};
+  for (const k of Object.keys(map)) {
+    if (counts[k] > 1 && /[,、]/.test(map[k])) {
+      parts[k] = map[k].split(/[,、]/).map((s) => s.trim());
+      cursor[k] = 0;
+    }
+  }
+  return xml.replace(re, (full, key) => {
     const k = "#" + key;
-    if (k in map) return xmlEscape(normalizePunctuation(map[k]));
-    return full; // unknown placeholder: leave as-is
+    if (!(k in map)) return full;
+    let value;
+    if (parts[k]) {
+      const i = Math.min(cursor[k], parts[k].length - 1);
+      value = parts[k][i];
+      cursor[k]++;
+    } else {
+      value = map[k];
+    }
+    return xmlEscape(normalizePunctuation(value));
   });
 }
 
@@ -594,10 +631,10 @@ function equationXml(content, eqnNumber) {
 }
 
 // ---------- Gemini OCR (table extraction) ----------
-// Returns rows[][] on success, or null on any failure (missing key, network error, parse failure).
+// Returns { rows } on success, or { error } on any failure (missing key, network error, parse failure).
 async function geminiOcrTable(imagePath) {
   const apiKey = readEnvVar("GEMINI_API_KEY");
-  if (!apiKey) return null;
+  if (!apiKey) return { error: "GEMINI_API_KEY が未設定です (`mkreport setup` で設定するか、.env に GEMINI_API_KEY=... を書いてください)" };
   try {
     const buf = fs.readFileSync(imagePath);
     const ext = path.extname(imagePath).slice(1).toLowerCase();
@@ -619,17 +656,32 @@ async function geminiOcrTable(imagePath) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      let apiMsg = "";
+      try { apiMsg = JSON.parse(errText)?.error?.message || ""; } catch {}
+      const detail = apiMsg || errText.slice(0, 300);
+      return { error: `Gemini API エラー (HTTP ${res.status} ${res.statusText})${detail ? `: ${detail}` : ""}` };
+    }
     const json = await res.json();
     const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return null;
+    if (!text) {
+      const blockReason = json?.promptFeedback?.blockReason;
+      const finishReason = json?.candidates?.[0]?.finishReason;
+      const reason = blockReason ? `ブロック理由: ${blockReason}` :
+                     finishReason ? `finishReason: ${finishReason}` :
+                     "応答にテキストが含まれていません";
+      return { error: `Gemini 応答が空 (${reason})` };
+    }
     // Strip any ```markdown ... ``` wrappers Gemini might add.
     const cleaned = text.replace(/^```\w*\s*\n?|\n?```\s*$/g, "");
     const blocks = parseMarkdown(cleaned);
     const tbl = blocks.find((b) => b.type === "table");
-    return tbl ? tbl.rows : null;
-  } catch {
-    return null;
+    if (!tbl) return { error: `Markdown 表が検出できません (応答冒頭: ${cleaned.slice(0, 200).replace(/\s+/g, " ")})` };
+    if (!tbl.rows || tbl.rows.length === 0) return { error: "Markdown 表は検出されましたが行が空です" };
+    return { rows: tbl.rows };
+  } catch (e) {
+    return { error: `例外: ${e?.message || String(e)}` };
   }
 }
 
@@ -678,6 +730,95 @@ function figureXml(rId, cx, cy, captionText) {
     `</wp:inline></w:drawing></w:r></w:p>`;
   const caption = pCenter(captionText, { keepLines: true });
   return drawing + caption;
+}
+
+// ---------- setup (GUI input for Gemini API key) ----------
+// Pops a native OS dialog so non-technical users can paste the key once.
+// The key is written to ~/.mkreport/config.env and reused by every later run.
+function promptApiKeyGUI() {
+  const title = "mkreport setup";
+  const prompt = "Gemini API キーを入力してください (取得: https://aistudio.google.com/apikey)";
+
+  if (process.platform === "darwin") {
+    const scriptLines = [
+      "try",
+      `set d to display dialog "${prompt}" default answer "" with title "${title}" with hidden answer`,
+      "return text returned of d",
+      "on error",
+      'return ""',
+      "end try",
+    ];
+    const args = scriptLines.flatMap((l) => ["-e", l]);
+    const r = spawnSync("osascript", args, { encoding: "utf8" });
+    if (r.error || r.status !== 0) return { error: r.error?.message || `osascript exit ${r.status}` };
+    return { key: r.stdout.trim() };
+  }
+
+  if (process.platform === "win32") {
+    const ps = [
+      "Add-Type -AssemblyName System.Windows.Forms,System.Drawing",
+      "$f = New-Object System.Windows.Forms.Form",
+      `$f.Text = '${title}'`,
+      "$f.Size = New-Object System.Drawing.Size(460,200)",
+      "$f.StartPosition = 'CenterScreen'",
+      "$f.Topmost = $true",
+      "$l = New-Object System.Windows.Forms.Label",
+      "$l.Location = New-Object System.Drawing.Point(10,15)",
+      "$l.Size = New-Object System.Drawing.Size(430,40)",
+      `$l.Text = '${prompt}'`,
+      "$f.Controls.Add($l)",
+      "$t = New-Object System.Windows.Forms.TextBox",
+      "$t.Location = New-Object System.Drawing.Point(10,60)",
+      "$t.Size = New-Object System.Drawing.Size(420,25)",
+      "$t.UseSystemPasswordChar = $true",
+      "$f.Controls.Add($t)",
+      "$ok = New-Object System.Windows.Forms.Button",
+      "$ok.Location = New-Object System.Drawing.Point(350,110)",
+      "$ok.Size = New-Object System.Drawing.Size(80,28)",
+      "$ok.Text = 'OK'",
+      "$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK",
+      "$f.AcceptButton = $ok",
+      "$f.Controls.Add($ok)",
+      "$c = New-Object System.Windows.Forms.Button",
+      "$c.Location = New-Object System.Drawing.Point(260,110)",
+      "$c.Size = New-Object System.Drawing.Size(80,28)",
+      "$c.Text = 'Cancel'",
+      "$c.DialogResult = [System.Windows.Forms.DialogResult]::Cancel",
+      "$f.CancelButton = $c",
+      "$f.Controls.Add($c)",
+      "$r = $f.ShowDialog()",
+      "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $t.Text }",
+    ].join("\n");
+    // UTF-16LE base64 avoids all quoting headaches on the PowerShell command line.
+    const encoded = Buffer.from(ps, "utf16le").toString("base64");
+    const r = spawnSync("powershell", ["-NoProfile", "-EncodedCommand", encoded], { encoding: "utf8" });
+    if (r.error || r.status !== 0) return { error: r.error?.message || `powershell exit ${r.status}` };
+    return { key: r.stdout.trim() };
+  }
+
+  // Linux: try zenity then kdialog.
+  let r = spawnSync("zenity", ["--entry", "--hide-text", `--title=${title}`, `--text=${prompt}`], { encoding: "utf8" });
+  if (!r.error && r.status === 0) return { key: r.stdout.trim() };
+  r = spawnSync("kdialog", ["--password", prompt, "--title", title], { encoding: "utf8" });
+  if (!r.error && r.status === 0) return { key: r.stdout.trim() };
+  return { error: "GUI ダイアログを起動できませんでした (zenity または kdialog をインストールしてください)" };
+}
+
+function runSetup() {
+  console.log("Gemini API キーを設定します。ダイアログに貼り付けてください。");
+  const { key, error } = promptApiKeyGUI();
+  if (error) {
+    console.error(`error: ${error}`);
+    process.exit(1);
+  }
+  if (!key) {
+    console.error("キャンセルされました (キーが空でした)。");
+    process.exit(1);
+  }
+  fs.mkdirSync(USER_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(USER_CONFIG_FILE, `GEMINI_API_KEY=${key}\n`, { mode: 0o600 });
+  console.log(`保存しました: ${USER_CONFIG_FILE}`);
+  console.log("以降、このコンピュータ上のすべての mkreport 実行で同じキーが使用されます。");
 }
 
 // ---------- scaffold ----------
@@ -800,11 +941,13 @@ async function buildReport(projectArg, outputArg) {
         if (ocrPath && /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(content)) {
           const info = parseTableFilename(content);
           if (info) out.push(pCenter(`表${info.number} ${info.name}`, { keepNext: true }));
-          const rows = await geminiOcrTable(ocrPath);
-          if (rows && rows.length > 0) {
-            out.push(tableXml(rows));
+          const result = await geminiOcrTable(ocrPath);
+          if (result.rows && result.rows.length > 0) {
+            out.push(tableXml(result.rows));
           } else {
-            out.push(pCenter("失敗"));
+            const reason = result.error || "不明なエラー";
+            console.warn(`[OCR 失敗] ${content}: ${reason}`);
+            out.push(pCenter(`失敗: ${reason}`));
           }
           continue;
         }
@@ -964,6 +1107,10 @@ async function buildReport(projectArg, outputArg) {
 
 // ---------- entry point ----------
 async function main() {
+  if (args[0] === "setup") {
+    runSetup();
+    return;
+  }
   if (args[0] === "start") {
     scaffold(args[1]);
     return;
