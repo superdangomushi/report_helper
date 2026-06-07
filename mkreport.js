@@ -284,6 +284,43 @@ function classifyLine(line) {
   return { level, kind: "text", content: rest };
 }
 
+// ---------- inline markup → runs ----------
+// Renders the inline syntax that can appear inside a paragraph or table cell:
+//   $...$     → an inline Word equation (OMML), reusing the math parser
+//   <br>      → a hard line break (also <br/> and <br />)
+// Everything else becomes plain text runs (punctuation normalized + XML-escaped).
+// This is what lets complex Markdown tables (math headers, multi-line cells)
+// survive conversion instead of leaking raw LaTeX / "<br>" into the document.
+function textRuns(text) {
+  // Split on <br> variants; each gap becomes a <w:br/> line break.
+  const parts = String(text ?? "").split(/<br\s*\/?>/i);
+  return parts
+    .map((part, idx) => {
+      const run =
+        part === ""
+          ? ""
+          : `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(part))}</w:t></w:r>`;
+      return idx < parts.length - 1 ? `${run}<w:r><w:br/></w:r>` : run;
+    })
+    .join("");
+}
+
+function renderInline(text) {
+  const s = String(text ?? "");
+  // $...$ inline math (single line, non-greedy; needs at least one inner char).
+  const re = /\$([^$\n]+?)\$/g;
+  let out = "";
+  let last = 0;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) out += textRuns(s.slice(last, m.index));
+    out += `<m:oMath>${mathToOMML(m[1])}</m:oMath>`;
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) out += textRuns(s.slice(last));
+  return out;
+}
+
 function pPlain(text, align = "left", opts = {}) {
   // paragraph with simple text; preserve leading/trailing spaces
   if (text === "") return `<w:p/>`;
@@ -304,7 +341,7 @@ function pPlain(text, align = "left", opts = {}) {
       out.push(
         `<w:p><w:pPr>${keep}${ind}${jc}</w:pPr>` +
           `<w:r><w:t>・</w:t></w:r><w:r><w:tab/></w:r>` +
-          `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(cur.content))}</w:t></w:r>` +
+          renderInline(cur.content) +
           `</w:p>`
       );
       i++;
@@ -322,7 +359,7 @@ function pPlain(text, align = "left", opts = {}) {
     const pPr = (keep || ind || jc) ? `<w:pPr>${keep}${ind}${jc}</w:pPr>` : "";
     const runs = items
       .map((line, idx, arr) => {
-        const t = `<w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(line))}</w:t></w:r>`;
+        const t = renderInline(line);
         return idx < arr.length - 1 ? `${t}<w:r><w:br/></w:r>` : t;
       })
       .join("");
@@ -333,7 +370,7 @@ function pPlain(text, align = "left", opts = {}) {
 
 function pCenter(text, opts = {}) {
   const keep = (opts.keepNext ? `<w:keepNext/>` : "") + (opts.keepLines ? `<w:keepLines/>` : "");
-  return `<w:p><w:pPr>${keep}<w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(normalizePunctuation(text))}</w:t></w:r></w:p>`;
+  return `<w:p><w:pPr>${keep}<w:jc w:val="center"/></w:pPr>${renderInline(text)}</w:p>`;
 }
 
 function tableXml(rows) {
