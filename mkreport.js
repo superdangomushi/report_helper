@@ -703,7 +703,7 @@ async function geminiOcrTable(imagePath) {
         ],
       }],
     };
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1066,9 +1066,17 @@ async function buildReport(projectArg, outputArg) {
 
   async function renderBlocks(blocks, fileName) {
     const out = [];
-    for (const b of blocks) {
+    for (let idx = 0; idx < blocks.length; idx++) {
+      const b = blocks[idx];
+      const next = blocks[idx + 1];
       if (b.type === "p") {
-        out.push(pPlain(b.text, b.align || "left"));
+        // A paragraph immediately before a table is treated as that table's
+        // title: keepNext glues it to the table so the caption never sits at the
+        // bottom of one page with the table pushed onto the next. (The --ocr path
+        // sets this directly; this covers cached <OCR-…> blocks built without --ocr
+        // and any plain "title + table" written by hand.)
+        const keepNext = next && next.type === "table";
+        out.push(pPlain(b.text, b.align || "left", { keepNext }));
       } else if (b.type === "table") {
         out.push(tableXml(b.rows));
       } else if (b.type === "fence") {
