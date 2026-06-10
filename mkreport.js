@@ -146,7 +146,10 @@ function splitByAlignment(text) {
   const chunks = [];
   let pos = 0;
   let current = "left";
-  const re = /\/([cr])|([cr])\//g;
+  // /c …c/ → center, /r …r/ → right. The lookarounds keep table cell-merge
+  // markers (<-/c … c/->) from being mistaken for alignment markers, which
+  // would otherwise split a table row apart before it reaches the parser.
+  const re = /(?<!<-)\/([cr])|([cr])\/(?!->)/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     if (m.index > pos) chunks.push({ align: current, text: text.slice(pos, m.index) });
@@ -373,26 +376,144 @@ function pCenter(text, opts = {}) {
   return `<w:p><w:pPr>${keep}<w:jc w:val="center"/></w:pPr>${renderInline(text)}</w:p>`;
 }
 
+// ---------- cell-merge markers (Word-like spanned cells) ----------
+// Horizontal merge: a cell beginning with "<-" opens a span and a cell ending
+// with "->" closes it; the cells in between collapse into one Word cell via
+// w:gridSpan. An optional /c, /l, /r (either side of the arrow) sets the
+// alignment, defaulting to center — e.g. "<-/c理論値 | c/->" spans two columns,
+// centered, showing "理論値".
+// Vertical merge: a cell ending with "-^" toggles a vertical span in its column.
+// The first "-^" cell opens the span (its text stays at the top), the next
+// closes it, and every cell between them joins via w:vMerge — e.g. "395-^" …
+// "" … "-^" merges three rows into one showing "395".
+function alignFromMarker(mk) {
+  if (!mk) return null;
+  const c = mk.toLowerCase();
+  if (c.includes("c")) return "center";
+  if (c.includes("l")) return "left";
+  if (c.includes("r")) return "right";
+  return null;
+}
+function parseHMergeStart(s) {
+  const m = /^<-\s*(\/?[clrCLR]\/?)?\s*([\s\S]*)$/.exec(s);
+  if (!m) return null;
+  return { align: alignFromMarker(m[1]), content: m[2].trim() };
+}
+function parseHMergeEnd(s) {
+  const m = /^([\s\S]*?)\s*(\/?[clrCLR]\/?)?->\s*$/.exec(s);
+  if (!m) return null;
+  return { align: alignFromMarker(m[2]), content: m[1].trim() };
+}
+function parseVMerge(s) {
+  const m = /^([\s\S]*?)\s*-\^\s*$/.exec(s);
+  if (!m) return null;
+  return { content: m[1].trim() };
+}
+
 function tableXml(rows) {
   // Apply hyo1.docx style: tblStyle "aa", double top border, no left/right; rows distributed evenly
   const colCount = Math.max(...rows.map((r) => r.length));
   // total width ~9000 dxa
   const colWidth = Math.floor(9000 / colCount);
   const gridCols = Array.from({ length: colCount }, () => `<w:gridCol w:w="${colWidth}"/>`).join("");
+  const R = rows.length;
 
-  const trXml = rows
+  // Build a cell model so merges can be resolved before emitting XML.
+  const M = rows.map((row) =>
+    Array.from({ length: colCount }, (_, c) => ({
+      content: row[c] ?? "",
+      align: "left",
+      gridSpan: 1,
+      vMerge: null, // 'restart' | 'continue'
+      hSkip: false, // covered by a gridSpan cell to its left → not emitted
+    }))
+  );
+
+  // Horizontal merges (per row): "<-" opens, "->" closes, gridSpan collapses.
+  for (let r = 0; r < R; r++) {
+    let c = 0;
+    while (c < colCount) {
+      const cell = M[r][c];
+      const start = parseHMergeStart(cell.content);
+      if (!start) { c++; continue; }
+      let content = start.content;
+      let align = start.align || "center";
+      // The opening cell can also carry the closing arrow (e.g. "<-/c理論値->").
+      const self = parseHMergeEnd(content);
+      if (self) {
+        cell.content = self.content;
+        cell.align = align;
+        c++;
+        continue;
+      }
+      let end = -1;
+      for (let k = c + 1; k < colCount; k++) {
+        const info = parseHMergeEnd(M[r][k].content);
+        if (info) {
+          end = k;
+          if (!content) content = info.content;
+          if (!start.align && info.align) align = info.align;
+          break;
+        }
+      }
+      cell.content = content;
+      cell.align = align;
+      if (end > c) {
+        cell.gridSpan = end - c + 1;
+        for (let k = c + 1; k <= end; k++) M[r][k].hSkip = true;
+        c = end + 1;
+      } else {
+        c++; // lone "<-": no closer found, keep it as a single centered cell
+      }
+    }
+  }
+
+  // Vertical merges (per column): paired "-^" markers fold rows together.
+  for (let c = 0; c < colCount; c++) {
+    let open = false;
+    for (let r = 0; r < R; r++) {
+      const cell = M[r][c];
+      if (cell.hSkip) continue;
+      const v = parseVMerge(cell.content);
+      if (v) {
+        if (!open) {
+          cell.vMerge = "restart";
+          cell.content = v.content;
+          open = true;
+        } else {
+          cell.vMerge = "continue";
+          cell.content = "";
+          open = false;
+        }
+      } else if (open) {
+        cell.vMerge = "continue";
+        cell.content = "";
+      }
+    }
+  }
+
+  const trXml = M
     .map((row, rIdx) => {
       // keepNext on every row but the last glues the rows together, so a table
       // that fits on one page jumps to the next page intact rather than splitting.
-      const keepNext = rIdx < rows.length - 1;
+      const keepNext = rIdx < R - 1;
       const tcs = [];
       for (let c = 0; c < colCount; c++) {
-        const cell = row[c] ?? "";
-        tcs.push(
-          `<w:tc><w:tcPr><w:tcW w:w="${colWidth}" w:type="dxa"/></w:tcPr>` +
-            pPlain(cell, "left", { keepNext }) +
-            `</w:tc>`
-        );
+        const cell = row[c];
+        if (cell.hSkip) continue;
+        const w = colWidth * cell.gridSpan;
+        const tcPr =
+          `<w:tcW w:w="${w}" w:type="dxa"/>` +
+          (cell.gridSpan > 1 ? `<w:gridSpan w:val="${cell.gridSpan}"/>` : "") +
+          (cell.vMerge === "restart" ? `<w:vMerge w:val="restart"/>` :
+           cell.vMerge === "continue" ? `<w:vMerge/>` : "") +
+          (cell.align === "center" ? `<w:vAlign w:val="center"/>` : "");
+        // A vMerge continuation row contributes an empty cell body.
+        const body =
+          cell.vMerge === "continue"
+            ? `<w:p/>`
+            : pPlain(cell.content, cell.align, { keepNext });
+        tcs.push(`<w:tc><w:tcPr>${tcPr}</w:tcPr>${body}</w:tc>`);
       }
       // cantSplit stops a single row from straddling a page boundary.
       return `<w:tr><w:trPr><w:cantSplit/></w:trPr>${tcs.join("")}</w:tr>`;
