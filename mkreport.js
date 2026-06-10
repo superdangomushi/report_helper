@@ -410,15 +410,13 @@ function parseVMerge(s) {
   return { content: m[1].trim() };
 }
 
-function tableXml(rows) {
-  // Apply hyo1.docx style: tblStyle "aa", double top border, no left/right; rows distributed evenly
+// Resolve the cell-merge markers into a grid model shared by the Word table
+// builder and the Excel export. Returns { colCount, R, M } where each
+// M[r][c] = { content, align, gridSpan, vMerge:'restart'|'continue'|null, hSkip }.
+function resolveMergedCells(rows) {
   const colCount = Math.max(...rows.map((r) => r.length));
-  // total width ~9000 dxa
-  const colWidth = Math.floor(9000 / colCount);
-  const gridCols = Array.from({ length: colCount }, () => `<w:gridCol w:w="${colWidth}"/>`).join("");
   const R = rows.length;
 
-  // Build a cell model so merges can be resolved before emitting XML.
   const M = rows.map((row) =>
     Array.from({ length: colCount }, (_, c) => ({
       content: row[c] ?? "",
@@ -492,6 +490,16 @@ function tableXml(rows) {
     }
   }
 
+  return { colCount, R, M };
+}
+
+function tableXml(rows) {
+  // Apply hyo1.docx style: tblStyle "aa", double top border, no left/right; rows distributed evenly
+  const { colCount, R, M } = resolveMergedCells(rows);
+  // total width ~9000 dxa
+  const colWidth = Math.floor(9000 / colCount);
+  const gridCols = Array.from({ length: colCount }, () => `<w:gridCol w:w="${colWidth}"/>`).join("");
+
   const trXml = M
     .map((row, rIdx) => {
       // keepNext on every row but the last glues the rows together, so a table
@@ -537,6 +545,125 @@ function tableXml(rows) {
     `</w:tbl>` +
     `<w:p/>` // spacer paragraph after table (Word requires a paragraph after a table)
   );
+}
+
+// ---------- Excel (.xlsx) export ----------
+// One sheet per table, same content as the Word table including cell merges.
+// An .xlsx is just a zipped OOXML package (like .docx), so we build it by hand
+// with JSZip rather than pulling in a spreadsheet dependency.
+
+// 0-based column index → spreadsheet letters (0→A, 25→Z, 26→AA, ...).
+function colLetter(n) {
+  let s = "";
+  n += 1;
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+// Excel sheet names: ≤31 chars, may not contain : \ / ? * [ ], and must be
+// unique within the workbook. `used` is a Set the caller carries across sheets.
+function sanitizeSheetName(name, fallback, used) {
+  let base = String(name ?? "").replace(/[:\\/?*\[\]]/g, " ").replace(/\s+/g, " ").trim();
+  if (!base) base = fallback;
+  base = base.slice(0, 31);
+  let out = base;
+  let n = 2;
+  while (used.has(out)) {
+    const suffix = `_${n++}`;
+    out = base.slice(0, 31 - suffix.length) + suffix;
+  }
+  used.add(out);
+  return out;
+}
+
+function sheetXml(rows) {
+  const { colCount, R, M } = resolveMergedCells(rows);
+  const isNumeric = (s) => /^-?\d+(?:\.\d+)?$/.test(s);
+  const merges = [];
+  const rowXmls = [];
+  for (let r = 0; r < R; r++) {
+    const cells = [];
+    for (let c = 0; c < colCount; c++) {
+      const cell = M[r][c];
+      // hSkip cells are covered by a gridSpan; vMerge continuations are blank
+      // bodies folded into the cell above — neither carries its own value.
+      if (cell.hSkip || cell.vMerge === "continue") continue;
+      // Compute the merge rectangle: gridSpan columns × contiguous vMerge rows.
+      let rowSpan = 1;
+      if (cell.vMerge === "restart") {
+        while (r + rowSpan < R && M[r + rowSpan][c].vMerge === "continue") rowSpan++;
+      }
+      const ref = `${colLetter(c)}${r + 1}`;
+      if (cell.gridSpan > 1 || rowSpan > 1) {
+        merges.push(`${ref}:${colLetter(c + cell.gridSpan - 1)}${r + rowSpan}`);
+      }
+      const v = cell.content;
+      if (v === "") continue;
+      if (isNumeric(v)) {
+        cells.push(`<c r="${ref}"><v>${v}</v></c>`);
+      } else {
+        cells.push(`<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(normalizePunctuation(v))}</t></is></c>`);
+      }
+    }
+    rowXmls.push(`<row r="${r + 1}">${cells.join("")}</row>`);
+  }
+  const mergeXml = merges.length
+    ? `<mergeCells count="${merges.length}">${merges.map((m) => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>`
+    : "";
+  return (
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `<sheetData>${rowXmls.join("")}</sheetData>` +
+    mergeXml + // schema order: sheetData then mergeCells
+    `</worksheet>`
+  );
+}
+
+// Build a workbook buffer from [{ name, rows }, ...]. Names are pre-sanitized.
+async function buildXlsx(sheets) {
+  const zip = new JSZip();
+  zip.file(
+    "[Content_Types].xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+      `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+      `<Default Extension="xml" ContentType="application/xml"/>` +
+      `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+      sheets
+        .map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`)
+        .join("") +
+      `</Types>`
+  );
+  zip.file(
+    "_rels/.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>` +
+      `</Relationships>`
+  );
+  zip.file(
+    "xl/workbook.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+      `<sheets>` +
+      sheets.map((s, i) => `<sheet name="${xmlEscape(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("") +
+      `</sheets></workbook>`
+  );
+  zip.file(
+    "xl/_rels/workbook.xml.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      sheets
+        .map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`)
+        .join("") +
+      `</Relationships>`
+  );
+  sheets.forEach((s, i) => zip.file(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s.rows)));
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
 // ---------- Math parser (LaTeX-like → OMML) ----------
@@ -1184,6 +1311,7 @@ async function buildReport(projectArg, outputArg) {
   }
 
   const mdRewrites = []; // {fileName, fenceContent, replacement}
+  const tableSheets = []; // {caption, rows} — one Excel sheet per table
 
   async function renderBlocks(blocks, fileName) {
     const out = [];
@@ -1200,6 +1328,11 @@ async function buildReport(projectArg, outputArg) {
         out.push(pPlain(b.text, b.align || "left", { keepNext }));
       } else if (b.type === "table") {
         out.push(tableXml(b.rows));
+        // A paragraph immediately above the table is its caption (used as the
+        // Excel sheet name); fall back to a running 表N number otherwise.
+        const prev = blocks[idx - 1];
+        const caption = prev && prev.type === "p" ? prev.text.split(/\n/)[0].trim() : "";
+        tableSheets.push({ caption, rows: b.rows });
       } else if (b.type === "fence") {
         // `<->` anywhere in the fence stretches a figure to the full text width.
         const fullWidth = b.content.includes("<->");
@@ -1220,6 +1353,7 @@ async function buildReport(projectArg, outputArg) {
           const result = await geminiOcrTable(ocrPath);
           if (result.rows && result.rows.length > 0) {
             out.push(tableXml(result.rows));
+            tableSheets.push({ caption: captionText, rows: result.rows });
             // Queue source .md rewrite: replace fence (or stale OCR block) with
             // a fresh <OCR-…>…</OCR-…> block so the user can edit / re-OCR later.
             const replacement =
@@ -1409,6 +1543,19 @@ async function buildReport(projectArg, outputArg) {
   const outBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
   fs.writeFileSync(OUTPUT, outBuf);
   console.log(`wrote ${OUTPUT}`);
+
+  // Companion .xlsx: one sheet per table, same name as the Word file.
+  if (tableSheets.length) {
+    const usedNames = new Set();
+    const sheets = tableSheets.map((t, i) => ({
+      name: sanitizeSheetName(t.caption, `表${i + 1}`, usedNames),
+      rows: t.rows,
+    }));
+    const xlsxOut = OUTPUT.replace(/\.docx$/i, "") + ".xlsx";
+    const xlsxBuf = await buildXlsx(sheets);
+    fs.writeFileSync(xlsxOut, xlsxBuf);
+    console.log(`wrote ${xlsxOut} (${sheets.length} 表)`);
+  }
 }
 
 // ---------- entry point ----------
